@@ -570,9 +570,12 @@ class Qwen2MoeModel(nn.Module):
                 hidden_states = input_embeds
             residual = None
         else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+            if torch.compiler.is_compiling():
+                torch._assert(pp_proxy_tensors is not None, "pp_proxy_tensors is None")
+            else:
+                assert pp_proxy_tensors is not None
+                hidden_states = pp_proxy_tensors["hidden_states"]
+                residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:
@@ -593,11 +596,17 @@ class Qwen2MoeModel(nn.Module):
                         if residual is not None
                         else hidden_states
                     )
-                with get_global_expert_distribution_recorder().with_current_layer(i):
-                    layer = self.layers[i]
+                layer = self.layers[i]
+                
+                if torch.compiler.is_compiling():
                     hidden_states, residual = layer(
                         positions, hidden_states, forward_batch, residual
                     )
+                else:
+                    with get_global_expert_distribution_recorder().with_current_layer(i):
+                        hidden_states, residual = layer(
+                            positions, hidden_states, forward_batch, residual
+                        )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
