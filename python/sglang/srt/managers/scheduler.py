@@ -791,7 +791,7 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
 
         # Init adaptive speculative decoding
-        self.adaptive_spec_threshold = server_args.apdative_speculative_batch_size_threshold
+        self.adaptive_spec_threshold = self.server_args.apdative_speculative_batch_size_threshold
         self.in_spec_transition = False
         self.spec_transition_remaining_reqs = 0
 

@@ -186,7 +186,24 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner):
+def get_batch_sizes_to_capture(
+    model_runner: ModelRunner,
+    strategy_min_bs: Optional[int] = None,
+    strategy_max_bs: Optional[int] = None,
+):
+    """Get batch sizes to capture for CUDA graph.
+
+    Args:
+        model_runner: The model runner instance.
+        strategy_min_bs: Optional minimum batch size for filtering.
+            If specified, only batch sizes >= strategy_min_bs will be captured.
+        strategy_max_bs: Optional maximum batch size for filtering.
+            If specified, only batch sizes <= strategy_max_bs will be captured.
+
+    Returns:
+        A tuple of (capture_bs, compile_bs) where capture_bs is a list of batch sizes
+        to capture and compile_bs is a list of batch sizes to compile.
+    """
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
@@ -206,6 +223,13 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
 
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+
+    # Apply strategy-based batch size filtering
+    if strategy_min_bs is not None:
+        capture_bs = [bs for bs in capture_bs if bs >= strategy_min_bs]
+    if strategy_max_bs is not None:
+        capture_bs = [bs for bs in capture_bs if bs <= strategy_max_bs]
+
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
@@ -232,7 +256,21 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        strategy_min_bs: Optional[int] = None,
+        strategy_max_bs: Optional[int] = None,
+    ):
+        """Initialize CudaGraphRunner.
+
+        Args:
+            model_runner: The model runner instance.
+            strategy_min_bs: Optional minimum batch size for filtering.
+                If specified, only batch sizes >= strategy_min_bs will be captured.
+            strategy_max_bs: Optional maximum batch size for filtering.
+                If specified, only batch sizes <= strategy_max_bs will be captured.
+        """
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
@@ -268,8 +306,14 @@ class CudaGraphRunner:
         self.is_dllm = self.dllm_config is not None
 
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, strategy_min_bs=strategy_min_bs, strategy_max_bs=strategy_max_bs
+        )
+        log_info_on_rank0(
+            logger,
+            f"Capture cuda graph bs {self.capture_bs}"
+            + (f" (filtered: min_bs={strategy_min_bs}, max_bs={strategy_max_bs})" if strategy_min_bs is not None or strategy_max_bs is not None else "")
+        )
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         self.capture_forward_mode = ForwardMode.DECODE

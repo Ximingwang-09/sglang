@@ -416,6 +416,16 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        # Initialize events dictionary only if MAB is enabled
+        events = {}
+        if self.use_mab:
+            events = {
+                "processing_start": torch.cuda.Event(enable_timing=True),
+                "processing_end": torch.cuda.Event(enable_timing=True),
+            }
+            # Record the start of processing
+            events["processing_start"].record()
+
         enable_sd = self.should_enable_sd(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
@@ -476,6 +486,16 @@ class EAGLEWorker(TpModelWorker):
                     can_run_cuda_graph=batch_result.can_run_cuda_graph,
                 )
 
+            if self.use_mab:
+                batch_size = batch.batch_size()
+                strategy = self.select_mab_strategy(batch_size)
+                self.mab_last_pull["batch_size"] = batch_size
+                self.mab_last_pull["mab_strategy"] = strategy
+
+            # Prune topk_p and topk_index to match current topk setting
+            batch.spec_info.topk_p = batch.spec_info.topk_p[:, : self.topk]
+            batch.spec_info.topk_index = batch.spec_info.topk_index[:, : self.topk]
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -495,6 +515,10 @@ class EAGLEWorker(TpModelWorker):
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
+
+            if self.use_mab:
+                events["processing_end"].record()
+                self.record_mab_strategy_metrics(events, verify_output.accept_length_per_req_cpu)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -1195,12 +1219,25 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_num_steps = steps
         self.topk = topk
         self.speculative_num_draft_tokens = draft_tokens
+        
+        # Update EAGLEWorker's server_args
         self.server_args.speculative_num_draft_tokens = draft_tokens
+        self.server_args.speculative_num_steps = steps
+        self.server_args.speculative_eagle_topk = topk
+
+        # Update target worker model runner server_args
         self.target_worker.model_runner.server_args.speculative_num_steps = steps
         self.target_worker.model_runner.server_args.speculative_eagle_topk = topk
         self.target_worker.model_runner.server_args.speculative_num_draft_tokens = (
             draft_tokens
         )
+
+        # Update draft model runner server_args
+        # This is critical because EAGLEDraftCudaGraphRunner reads these values from model_runner.server_args
+        self.draft_model_runner.server_args.speculative_num_steps = steps
+        self.draft_model_runner.server_args.speculative_eagle_topk = topk
+        self.draft_model_runner.server_args.speculative_num_draft_tokens = draft_tokens
+
         self.padded_static_len = self.speculative_num_steps + 1
         self.last_mab_strategy = mab_strategy
 
@@ -1278,13 +1315,15 @@ class EAGLEWorker(TpModelWorker):
         self.mab_algorithm = self.server_args.speculative_eagle_mab_algorithm
         self.last_mab_strategy = None
 
-        # Initialize resources for the default strategy
-        self.mab_strategies = [self.default_mab_strategy]
         self.strategy_resources: Dict[str, SpeculativeResources] = {}
 
-        # Parse additional MAB strategies if provided
-        self.mab_strategies.extend(self.server_args.speculative_eagle_mab_configs)
-        self.mab_strategies = sorted(list(set(self.mab_strategies)))
+        # If user provided MAB configs, use them; otherwise use only the default strategy
+        if self.server_args.speculative_eagle_mab_configs:
+            # Use user-provided strategies only
+            self.mab_strategies = sorted(list(set(self.server_args.speculative_eagle_mab_configs)))
+        else:
+            # No MAB configs provided, use the default strategy only
+            self.mab_strategies = [self.default_mab_strategy]
 
         # Calculate max topk needed across all strategies
         max_topk_needed = max(MABConfig.parse_config(strategy)[1] for strategy in self.mab_strategies)
@@ -1377,6 +1416,12 @@ class EAGLEWorker(TpModelWorker):
                 target_cuda_graph_runner=target_resources["cuda_graph_runner"],
             )
 
+        # Set the default strategy to use:
+        # - If user provided MAB configs, use the first one from the sorted list
+        # - Otherwise, use the auto-generated default strategy
+        if self.server_args.speculative_eagle_mab_configs:
+            self.default_mab_strategy = self.mab_strategies[0]
+        
         self.set_mab_strategy(self.default_mab_strategy)
 
 

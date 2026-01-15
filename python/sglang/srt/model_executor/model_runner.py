@@ -1973,8 +1973,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.tp_group.barrier()
         run_once()
 
-    def init_device_graphs(self):
-        """Capture device graphs."""
+    def init_device_graphs(
+        self, strategy_min_bs: Optional[int] = None, strategy_max_bs: Optional[int] = None
+    ):
+        """Capture device graphs.
+
+        Args:
+            strategy_min_bs: Optional minimum batch size for CUDA graph capture filtering.
+                If specified, only batch sizes >= strategy_min_bs will be captured.
+            strategy_max_bs: Optional maximum batch size for CUDA graph capture filtering.
+                If specified, only batch sizes <= strategy_max_bs will be captured.
+        """
         self.graph_runner = None
         self.graph_mem_usage = 0
 
@@ -2003,7 +2012,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "npu": NPUGraphRunner,
             },
         )
-        self.graph_runner = graph_runners[self.device](self)
+        self.graph_runner = graph_runners[self.device](
+            self, strategy_min_bs=strategy_min_bs, strategy_max_bs=strategy_max_bs
+        )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
