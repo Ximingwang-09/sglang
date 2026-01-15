@@ -790,6 +790,12 @@ class Scheduler(
         ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
         self.new_token_ratio = self.init_new_token_ratio
 
+        # Init adaptive speculative decoding
+        self.adaptive_spec_threshold = server_args.apdative_speculative_batch_size_threshold
+        self.in_spec_transition = False
+        self.spec_transition_remaining_reqs = 0
+
+
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
