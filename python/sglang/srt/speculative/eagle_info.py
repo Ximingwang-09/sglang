@@ -806,8 +806,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
-        self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
-        self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        # Handle different topk sizes when using MAB (Multi-Armed Bandit) strategies.
+        # The running batch may have a different topk than the new prefilled request.
+        # Prune to the minimum topk to ensure consistent dimensions.
+        self_topk = self.topk_p.shape[1]
+        other_topk = spec_info.topk_p.shape[1]
+        min_topk = min(self_topk, other_topk)
+        self.topk_p = torch.cat([self.topk_p[:, :min_topk], spec_info.topk_p[:, :min_topk]])
+        self.topk_index = torch.cat([self.topk_index[:, :min_topk], spec_info.topk_index[:, :min_topk]])
 
 
 @dataclass

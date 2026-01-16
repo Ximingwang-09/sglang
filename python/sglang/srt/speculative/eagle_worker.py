@@ -199,11 +199,20 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
+
+        # MAB configuration - check early to determine if we should skip default CUDA graph init
+        self.use_mab = server_args.speculative_eagle_mab_configs is not None
+        self.max_topk = self.topk
+        self.strategy_min_bs = None
+        self.strategy_max_bs = None
+
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
-            self.init_cuda_graphs()
+            # Skip default CUDA graph init when using MAB - _init_mab_configurations will handle it
+            if not self.use_mab:
+                self.init_cuda_graphs()
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -226,11 +235,7 @@ class EAGLEWorker(TpModelWorker):
             )
             self.init_target_normal_decode_graph()
 
-        # MAB configuration
-        self.use_mab = server_args.speculative_eagle_mab_configs is not None
-        self.max_topk = self.topk
-        self.strategy_min_bs = None
-        self.strategy_max_bs = None
+        # Initialize MAB if enabled
         if self.use_mab:
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
