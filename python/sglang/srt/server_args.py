@@ -447,7 +447,6 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
-    apdative_speculative_batch_size_threshold: Optional[int] = None
     speculative_eagle_mab_algorithm: Optional[str] = "EG"
     speculative_eagle_mab_configs: Optional[List[str]] = None
     speculative_mab_window_size: int = 300
@@ -3629,14 +3628,6 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
-        )
-        parser.add_argument(
-            "--apdative-speculative-batch-size-threshold",
-            type=int,
-            default=ServerArgs.apdative_speculative_batch_size_threshold,
-            help="Batch size threshold for adaptive speculative decoding. "
-            "When set, SD is disabled initially and only enabled after "
-            "batch_size <= threshold for several consecutive decode batches.",
         )
         parser.add_argument(
             "--speculative-eagle-mab-algorithm",

@@ -220,20 +220,6 @@ class EAGLEWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        # Adaptive SD configuration
-        self.adaptive_spec_threshold = server_args.apdative_speculative_batch_size_threshold
-        self.adaptive_spec_warmup_checks = 10  # Consecutive checks to enable SD
-        self.adaptive_spec_consecutive_checks = 0  # Counter for qualifying checks
-        self.adaptive_spec_enabled = False  # Track if speculation is enabled
-        self.pending_transition_to_sd = False  # Flag to trigger requeue
-
-        if self.adaptive_spec_threshold is not None:
-            logger.info(
-                f"[AdaptiveSpec] Initialized with threshold={self.adaptive_spec_threshold}. "
-                f"Speculative decoding will be disabled until batch_size <= {self.adaptive_spec_threshold} "
-                f"for {self.adaptive_spec_warmup_checks} consecutive decode batches."
-            )
-            self.init_target_normal_decode_graph()
 
         # Initialize MAB if enabled
         if self.use_mab:
@@ -303,107 +289,6 @@ class EAGLEWorker(TpModelWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
-    def init_target_normal_decode_graph(self):
-        """Initialize CUDA graph for normal decoding on the target worker."""
-        if self.server_args.disable_cuda_graph:
-            return
-
-        logger.info("Capture target normal decode cuda graph begin.")
-        target_runner = self.target_worker.model_runner
-
-        # Backup
-        old_spec_algo = target_runner.spec_algorithm
-        old_attn_backend = target_runner.attn_backend
-        old_graph_runner = target_runner.graph_runner
-
-        try:
-            # Switch to normal decode mode
-            target_runner.spec_algorithm = SpeculativeAlgorithm.NONE
-
-            # Init attention backend for normal decode
-            target_runner.init_attention_backend()
-            self.target_normal_decode_attn_backend = target_runner.attn_backend
-
-            # Init cuda graph for normal decode
-            min_bs = (
-                (self.adaptive_spec_threshold + 1)
-                if self.adaptive_spec_threshold is not None
-                else 1
-            )
-            target_runner.init_device_graphs(strategy_min_bs=min_bs)
-            self.target_normal_decode_graph_runner = target_runner.graph_runner
-
-        finally:
-            # Restore
-            target_runner.spec_algorithm = old_spec_algo
-            target_runner.attn_backend = old_attn_backend
-            target_runner.graph_runner = old_graph_runner
-
-        logger.info("Capture target normal decode cuda graph end.")
-
-    def reset_adaptive_spec_params(self):
-        """Reset adaptive speculative decoding state."""
-        self.adaptive_spec_consecutive_checks = 0
-        self.adaptive_spec_enabled = False
-        self.pending_transition_to_sd = False
-
-    def check_and_trigger_transition(self):
-        """Check if a transition to SD is pending."""
-        if self.adaptive_spec_threshold is None:
-            return False
-
-        if self.pending_transition_to_sd:
-            self.pending_transition_to_sd = False
-            return True
-        return False
-
-    def should_enable_sd(self, batch: ScheduleBatch) -> bool:
-        """Check whether speculation should be enabled for this batch."""
-        # If no adaptive spec configured, always enable speculation
-        if self.adaptive_spec_threshold is None:
-            return True
-
-        # If transition is pending, do not enable SD until after abort
-        if self.pending_transition_to_sd:
-            return False
-
-        # If already enabled, keep it enabled
-        if self.adaptive_spec_enabled:
-            return True
-
-        # Check batch size
-        batch_size = batch.batch_size()
-
-        # For EXTEND batches, always run (to establish draft model state)
-        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            return True
-
-        # For DECODE batches, check threshold with warmup
-        if batch_size <= self.adaptive_spec_threshold:
-            self.adaptive_spec_consecutive_checks += 1
-
-            if self.adaptive_spec_consecutive_checks >= self.adaptive_spec_warmup_checks:
-                if not self.adaptive_spec_enabled:
-                    logger.debug(
-                        f"[AdaptiveSpec] ENABLING speculation after "
-                        f"{self.adaptive_spec_consecutive_checks} checks (batch_size={batch_size}). "
-                        f"Will requeue requests for EXTEND."
-                    )
-                    self.adaptive_spec_enabled = True
-                    self.pending_transition_to_sd = True
-                    return False
-                else:
-                    return True
-        else:
-            # Reset counter if batch size exceeds threshold
-            if self.adaptive_spec_consecutive_checks > 0:
-                logger.info(
-                    f"[AdaptiveSpec] Batch size {batch_size} > threshold {self.adaptive_spec_threshold}, "
-                    f"resetting counter (was {self.adaptive_spec_consecutive_checks})."
-                )
-            self.adaptive_spec_consecutive_checks = 0
-
-        return False
 
     @property
     def draft_model_runner(self):
@@ -431,19 +316,16 @@ class EAGLEWorker(TpModelWorker):
             # Record the start of processing
             events["processing_start"].record()
 
-        enable_sd = self.should_enable_sd(batch)
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
-            if enable_sd:
-                with self.draft_tp_context(
-                    self.draft_model_runner.tp_group
-                ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                    self.forward_draft_extend(
-                        batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
-                    )
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                self.forward_draft_extend(
+                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
+                )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -451,46 +333,6 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
-            if not enable_sd:
-                # Temporarily disable spec to make target worker treat this as normal decode
-                batch.spec_algorithm = SpeculativeAlgorithm.NONE
-                batch.spec_info = None
-
-                model_worker_batch = batch.get_model_worker_batch()
-
-                # Swap resources if we have them
-                use_normal_graph = (
-                    self.adaptive_spec_threshold is not None
-                    and hasattr(self, "target_normal_decode_graph_runner")
-                    and self.target_normal_decode_graph_runner is not None
-                )
-
-                if use_normal_graph:
-                    old_attn = self.target_worker.model_runner.attn_backend
-                    old_graph = self.target_worker.model_runner.graph_runner
-                    self.target_worker.model_runner.attn_backend = (
-                        self.target_normal_decode_attn_backend
-                    )
-                    self.target_worker.model_runner.graph_runner = (
-                        self.target_normal_decode_graph_runner
-                    )
-
-                try:
-                    batch_result = self.target_worker.forward_batch_generation(
-                        model_worker_batch
-                    )
-                finally:
-                    if use_normal_graph:
-                        self.target_worker.model_runner.attn_backend = old_attn
-                        self.target_worker.model_runner.graph_runner = old_graph
-
-                return GenerationBatchResult(
-                    logits_output=batch_result.logits_output,
-                    next_token_ids=batch_result.next_token_ids,
-                    num_accepted_tokens=0,  # No speculation
-                    can_run_cuda_graph=batch_result.can_run_cuda_graph,
-                )
-
             if self.use_mab:
                 batch_size = batch.batch_size()
                 strategy = self.select_mab_strategy(batch_size)
